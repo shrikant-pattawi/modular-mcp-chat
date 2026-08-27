@@ -1,5 +1,5 @@
 import os
-import asyncio
+import json
 import logging
 import datetime
 from pathlib import Path
@@ -41,17 +41,110 @@ async def query_database(sql_query: str) -> str:
         return await mcp_manager.call_tool("query_database", {"sql_query": sql_query})
     return "Error: MCP Server is offline."
 
+async def _call_openai_fallback(prompt: str, history: Optional[List[Dict[str, str]]], openai_key: str) -> str:
+    """Fallback handler using OpenAI GPT-4o-mini with MCP tools."""
+    try:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=openai_key)
+
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": "You are a helpful AI assistant with access to local database and clock tools. Use tools when relevant."}
+        ]
+        if history:
+            for item in history:
+                role = "assistant" if item.get("role") in ["assistant", "model"] else "user"
+                messages.append({"role": role, "content": item.get("content", "")})
+        messages.append({"role": "user", "content": prompt})
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_current_time",
+                    "description": "Returns current UTC or local timezone time",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"timezone_name": {"type": "string", "default": "UTC"}}
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_database_tables",
+                    "description": "Lists all available tables and schemas in SQLite database",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "query_database",
+                    "description": "Executes read-only SELECT SQL query on database",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"sql_query": {"type": "string"}},
+                        "required": ["sql_query"]
+                    }
+                }
+            }
+        ]
+
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            tools=tools
+        )
+        choice = response.choices[0].message
+
+        # Handle tool calls if requested
+        if choice.tool_calls:
+            messages.append(choice)
+            for tool_call in choice.tool_calls:
+                name = tool_call.function.name
+                try:
+                    args = json.loads(tool_call.function.arguments) if tool_call.function.arguments else {}
+                except Exception:
+                    args = {}
+
+                if name == "get_current_time":
+                    tool_output = await get_current_time(**args)
+                elif name == "list_database_tables":
+                    tool_output = await list_database_tables()
+                elif name == "query_database":
+                    tool_output = await query_database(**args)
+                else:
+                    tool_output = f"Unknown tool: {name}"
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": tool_output
+                })
+
+            second_response = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages
+            )
+            return second_response.choices[0].message.content or "No response from OpenAI."
+
+        return choice.content or "No response from OpenAI."
+
+    except Exception as e:
+        logger.error(f"OpenAI fallback error: {e}")
+        return f"Both Gemini and OpenAI requests failed. OpenAI error: {str(e)}"
+
 async def get_llm_response(prompt: str, history: Optional[List[Dict[str, str]]] = None, manager=None) -> str:
     """
-    Sends a user prompt to Gemini API (or Groq / OpenAI fallback) with automatic tool execution.
+    Primary: Google Gemini API.
+    Automatic Fallback: OpenAI GPT-4o-mini (if OPENAI_API_KEY is configured in .env).
     """
     _reload_env()
     
     gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
-    groq_key = os.getenv("GROQ_API_KEY", "").strip()
     openai_key = os.getenv("OPENAI_API_KEY", "").strip()
 
-    # Priority 1: Google Gemini API
+    # Step 1: Try Primary Provider (Google Gemini)
     if gemini_key and gemini_key != "your_gemini_api_key_here":
         try:
             from google import genai
@@ -93,16 +186,23 @@ async def get_llm_response(prompt: str, history: Optional[List[Dict[str, str]]] 
 
         except Exception as e:
             error_msg = str(e)
-            logger.warning(f"Gemini API call failed: {error_msg}")
-            
-            if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
-                # If Groq or OpenAI key is not provided, inform user clearly
-                if (not groq_key or groq_key == "your_groq_api_key_here") and (not openai_key or openai_key == "your_openai_api_key_here"):
-                    return (
-                        "⏳ Gemini Daily/Minute Quota Reached.\n\n"
-                        "Options:\n"
-                        "1. Wait ~45 seconds for per-minute reset.\n"
-                        "2. Or generate a fresh free Gemini key at https://aistudio.google.com/app/apikey (choose 'Create API key in new project')."
-                    )
+            logger.warning(f"Primary Gemini call failed: {error_msg}. Checking for OpenAI fallback...")
 
-    return "Error: No valid API key configured. Please set GEMINI_API_KEY in backend/.env"
+            # Step 2: If OpenAI Key is available, trigger fallback
+            if openai_key and openai_key != "your_openai_api_key_here":
+                logger.info("Executing automatic fallback to OpenAI (gpt-4o-mini)...")
+                return await _call_openai_fallback(prompt, history, openai_key)
+
+            # If no OpenAI key, return quota guidance
+            if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
+                return (
+                    "⏳ Gemini Quota Reached.\n\n"
+                    "Tip: You can either wait ~45s for the free-tier reset, or add `OPENAI_API_KEY` to `backend/.env` for automatic instant failover!"
+                )
+            return f"Error communicating with Gemini: {error_msg}"
+
+    # Step 3: If Gemini key is not set, but OpenAI key is set
+    if openai_key and openai_key != "your_openai_api_key_here":
+        return await _call_openai_fallback(prompt, history, openai_key)
+
+    return "Error: No valid API key configured. Please set GEMINI_API_KEY or OPENAI_API_KEY in backend/.env"
