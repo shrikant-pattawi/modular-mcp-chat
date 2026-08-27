@@ -1,0 +1,52 @@
+/* Custom Styles & Utilities for Modular MCP Chat */
+
+/* Smooth scrollbar for chat history window */
+#chat-history::-webkit-scrollbar {
+    width: 6px;
+}
+
+#chat-history::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+#chat-history::-webkit-scrollbar-thumb {
+    background: #374151;
+    border-radius: 9999px;
+}
+
+#chat-history::-webkit-scrollbar-thumb:hover {
+    background: #4B5563;
+}
+
+/* User message bubble animation */
+.user-bubble {
+    animation: fadeInRight 0.25s ease-out forwards;
+}
+
+/* AI message bubble animation */
+.ai-bubble {
+    animation: fadeInLeft 0.25s ease-out forwards;
+}
+
+@keyframes fadeInRight {
+    from {
+        opacity: 0;
+        transform: translateX(10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateX(0);
+    }
+}
+
+@keyframes fadeInLeft {
+    from {
+        opacity: 0;
+        transform: translateX(-10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateX(0);
+    }
+}
+

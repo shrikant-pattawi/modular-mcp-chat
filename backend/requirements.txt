@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+mcp
+python-dotenv
+google-genai
+openai
